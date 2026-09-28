@@ -41,6 +41,8 @@ public final class AutoMountModule extends Module {
      */
     private volatile boolean recoveryEnabled;
     private volatile Entity rememberedMinecart;
+    /** Keeps an OFF transition atomic with a concurrent attempt to remember a cart. */
+    private final Object targetStateLock = new Object();
 
     @Override
     public boolean enabledSetting() {
@@ -171,9 +173,14 @@ public final class AutoMountModule extends Module {
      * Minecart cannot replace a still-valid remembered cart.
      */
     private void rememberMinecartIfEligible(final Entity vehicle) {
-        final Entity currentTarget = validRememberedMinecart();
-        if (currentTarget == null || currentTarget == vehicle) {
-            rememberedMinecart = vehicle;
+        synchronized (targetStateLock) {
+            // OFF must win over an already-running tick or scheduled callback.
+            if (!recoveryEnabled) return;
+
+            final Entity currentTarget = validRememberedMinecart();
+            if (currentTarget == null || currentTarget == vehicle) {
+                rememberedMinecart = vehicle;
+            }
         }
     }
 
@@ -238,7 +245,9 @@ public final class AutoMountModule extends Module {
     }
 
     private void clearRememberedMinecart() {
-        rememberedMinecart = null;
+        synchronized (targetStateLock) {
+            rememberedMinecart = null;
+        }
     }
 
     private final class PassengerUpdateHandler implements ClientEventLoopPacketHandler<ClientboundSetPassengersPacket, ClientSession> {
