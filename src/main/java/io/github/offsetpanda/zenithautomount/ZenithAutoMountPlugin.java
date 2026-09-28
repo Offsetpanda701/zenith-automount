@@ -10,7 +10,7 @@ import io.github.offsetpanda.zenithautomount.module.AutoMountModule;
     id = BuildConstants.PLUGIN_ID,
     version = BuildConstants.VERSION,
     description = "Remounts the same standard Minecart after dismount",
-    url = "https://github.com/OffsetPanda/zenith-automount",
+    url = "https://github.com/Offsetpanda701/zenith-automount",
     authors = {"OffsetPanda"},
     mcVersions = {BuildConstants.MC_VERSION}
 )
