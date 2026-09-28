@@ -1,0 +1,23 @@
+# Build and IDE state
+.gradle/
+build/
+out/
+.idea/
+.vscode/
+*.iml
+*.ipr
+*.class
+
+# Local ZenithProxy runtime state and generated configuration
+run/
+log/
+plugins/
+/*.json*
+
+# OS and temporary files
+.DS_Store
+*.tmp
+
+# Local secrets are never part of this plugin project
+.env
+.env.*
