@@ -34,9 +34,13 @@ public final class AutoMountCommand extends Command {
     }
 
     private void setEnabled(final com.mojang.brigadier.context.CommandContext<CommandContext> context, final boolean enabled) {
-        autoMountModule.setAutomountEnabled(enabled);
-        context.getSource().getEmbed()
-            .title(enabled ? "Automount enabled." : "Automount disabled.")
-            .primaryColor();
+        final boolean actualEnabled = autoMountModule.setAutomountEnabled(enabled);
+        final var embed = context.getSource().getEmbed();
+        if (actualEnabled != enabled) {
+            embed.title(enabled ? "Automount could not be enabled. Check the Zenith log."
+                : "Automount could not be disabled. Check the Zenith log.").errorColor();
+        } else {
+            embed.title(actualEnabled ? "Automount enabled." : "Automount disabled.").primaryColor();
+        }
     }
 }
