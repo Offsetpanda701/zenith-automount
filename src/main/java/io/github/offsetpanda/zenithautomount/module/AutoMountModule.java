@@ -33,7 +33,7 @@ import static com.zenith.Globals.MODULE_LOG;
 
 /** Recovers only the exact normal Minecart the bot actually rode; never searches for carts. */
 public final class AutoMountModule extends Module {
-    // Commands/lifecycle events and the network send callback share this lock.
+    // Commands/lifecycle events and the client send callback share this lock.
     // Mutable entity/position reads stay on the client event loop.
     private final Object targetStateLock = new Object();
     private boolean recoveryEnabled;
@@ -143,41 +143,57 @@ public final class AutoMountModule extends Module {
                 clearTarget("player not alive");
                 return;
             }
-            // The built-in handler already mounted/dismounted the cached player.
-            // This captures even a mount and dismount between consecutive ticks.
+            // A vehicle switch can leave Zenith's player vehicle fields stale when
+            // the old cart's empty passenger update follows the new cart's mount.
+            // The server passenger list is the authoritative confirmation.
             final Entity player = CACHE.getPlayerCache().getThePlayer();
-            if (player.isInVehicle() && packet.getEntityId() == player.getVehicleId()) {
-                requirePassengerMount = false;
+            for (final int passengerId : packet.getPassengerIds()) {
+                if (passengerId == player.getEntityId()) {
+                    requirePassengerMount = false;
+                    final Entity vehicle = CACHE.getEntityCache().get(packet.getEntityId());
+                    if (isValidMinecart(vehicle)) rememberRide(vehicle);
+                    else clearTarget("player already mounted");
+                    return;
+                }
             }
             if (observeCurrentVehicle()) return;
             final Entity target = validRememberedMinecart();
-            if (target != null && packet.getEntityId() == target.getEntityId() && !recovering) {
+            if (target != null && packet.getEntityId() == target.getEntityId()) {
                 beginRecovery(target);
                 attemptRemount(target);
             }
         }
     }
 
-    /** Returns true whenever the player is already in a vehicle. Called on the client loop. */
+    /** Uses server passenger membership even when Zenith's player vehicle fields disagree. */
     private boolean observeCurrentVehicle() {
         final Entity player = CACHE.getPlayerCache().getThePlayer();
-        if (!player.isInVehicle()) return false;
         // Same-dimension respawn can retain old passenger fields in Zenith's cache.
         // A fresh server passenger update must establish the next ride after a reset.
-        if (requirePassengerMount) return true;
-        final Entity vehicle = CACHE.getEntityCache().get(player.getVehicleId());
+        if (requirePassengerMount) return player.isInVehicle();
+        final Entity vehicle = player.isInVehicle()
+            ? CACHE.getEntityCache().get(player.getVehicleId()) : null;
         if (isValidMinecart(vehicle) && vehicle.getPassengerIds().contains(player.getEntityId())) {
-            if (rememberedMinecart != vehicle || recovering) {
-                final boolean remounted = recovering && rememberedMinecart == vehicle;
-                clearTarget();
-                rememberedMinecart = vehicle; // A real ride in B always replaces A.
-                MODULE_LOG.info(remounted ? "[AutoMount] remount confirmed id={}"
-                    : "[AutoMount] mounted minecart id={}", vehicle.getEntityId());
-            }
-        } else {
-            clearTarget("player already mounted");
+            rememberRide(vehicle);
+            return true;
         }
+        if (isValidMinecart(rememberedMinecart)
+            && rememberedMinecart.getPassengerIds().contains(player.getEntityId())) {
+            rememberRide(rememberedMinecart);
+            return true;
+        }
+        if (!player.isInVehicle()) return false;
+        clearTarget("player already mounted");
         return true;
+    }
+
+    private void rememberRide(final Entity vehicle) {
+        if (rememberedMinecart == vehicle && !recovering) return;
+        final boolean remounted = recovering && rememberedMinecart == vehicle;
+        clearTarget();
+        rememberedMinecart = vehicle;
+        MODULE_LOG.info(remounted ? "[AutoMount] remount confirmed id={}"
+            : "[AutoMount] mounted minecart id={}", vehicle.getEntityId());
     }
 
     private boolean isValidMinecart(final Entity entity) {
@@ -218,36 +234,41 @@ public final class AutoMountModule extends Module {
 
     /** One immediate attempt, then at most one per client tick; no cooldown or retry scheduler. */
     private void attemptRemount(final Entity target) {
-        if (!isReachable(target)) {
-            clearTarget("target out of range"); // Cannot restart without a real ride.
-            return;
-        }
-        if (!target.getPassengerIds().isEmpty()) {
-            if (!targetOccupied) MODULE_LOG.info("[AutoMount] target occupied id={}", target.getEntityId());
-            targetOccupied = true;
-            return;
-        }
-        targetOccupied = false;
-        if (interactionPending) return; // No backlog if the network loop is busy.
+        if (interactionPending) return;
         final ClientSession client = Proxy.getInstance().getClient();
         if (client == null || !client.isConnected() || client.getChannel() == null) return;
         final long generation = stateGeneration;
         interactionPending = true;
         try {
-            // sendAsync queues an unguarded send. Guard on the network loop immediately
-            // before send(), so OFF/success/reset cancels even an already-queued attempt.
-            client.getChannel().eventLoop().execute(() -> {
+            // Finish already-queued passenger/teleport updates before evaluating
+            // recovery. Dismount can arrive before the authoritative player position.
+            // send() uses the same client-loop context as Zenith's normal right click.
+            client.getClientEventLoop().execute(() -> {
                 synchronized (targetStateLock) {
                     if (generation != stateGeneration) return;
                     interactionPending = false;
                     if (!recoveryEnabled || !recovering || rememberedMinecart != target
                         || Proxy.getInstance().getClient() != client || !client.isConnected()
                         || client.getPacketProtocol().getOutboundState() != ProtocolState.GAME) return;
-                    // The cache map is concurrent; no mutable position reads on this loop.
-                    if (CACHE.getEntityCache().get(target.getEntityId()) != target) {
+                    if (!CACHE.getPlayerCache().isAlive()) {
+                        clearTarget("player not alive");
+                        return;
+                    }
+                    if (observeCurrentVehicle()) return;
+                    if (!isValidMinecart(target)) {
                         clearTarget("target removed/invalid");
                         return;
                     }
+                    if (!isReachable(target)) {
+                        clearTarget("target out of range");
+                        return;
+                    }
+                    if (!target.getPassengerIds().isEmpty()) {
+                        if (!targetOccupied) MODULE_LOG.info("[AutoMount] target occupied id={}", target.getEntityId());
+                        targetOccupied = true;
+                        return;
+                    }
+                    targetOccupied = false;
                     if (!attemptLogged) {
                         MODULE_LOG.info("[AutoMount] remount attempt id={}", target.getEntityId());
                         attemptLogged = true;

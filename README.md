@@ -44,11 +44,11 @@ Zenith AutoMount keeps the exact Minecart entity that the bot actually mounted. 
 
 A processed dismount triggers an immediate ordinary `INTERACT` with that cart, using the main hand without sneaking. If it remains reachable and unoccupied, each subsequent client tick retries (normally about 20 times per second). Reach is measured from the current cached player eye position to the cart's current bounding box, using the server's entity-interaction-range attribute (3 blocks by default), without extra reach or rotation. An occupied cart is skipped until free; a cart outside reach ends that recovery episode, even if it later returns. A new real ride arms recovery again and replaces any older target.
 
-Queued interactions are cancelled when recovery stops or AutoMount is disabled. There is no movement, pathfinding, chasing, or separate retry scheduler.
+Server passenger membership confirms the ride even if Zenith's cached player vehicle fields disagree during a cart switch. Before sending, the client event loop finishes already-queued passenger and teleport updates, then checks the current cached position and target. Queued interactions are cancelled when recovery stops or AutoMount is disabled. There is no movement, pathfinding, chasing, or separate retry scheduler.
 
-Version 1.1.0 logs `[AutoMount]` transitions: enabled, mounted minecart, dismount detected, first remount attempt, remount confirmed, target occupied, target out of range, target removed/invalid, lifecycle cancellation, and disabled. Cart messages include the entity ID. Retries do not log every tick.
+The plugin logs `[AutoMount]` transitions: enabled, mounted minecart, dismount detected, first remount attempt, remount confirmed, target occupied, target out of range, target removed/invalid, lifecycle cancellation, and disabled. Cart messages include the entity ID. Retries do not log every tick.
 
-Real-world Minecraft/2b2t behavior still requires user testing; a successful build alone does not verify it.
+Version 1.2.0 was runtime-tested on a localhost vanilla Minecraft 1.21.4 server with ZenithProxy 3.7.2 (Java 1.21.4 build), with the bot running alone. Server passenger relationships and inbound passenger updates confirmed stationary and powered-rail remounts, including sneak-key exits and cart-switch regressions. OFF, range loss, cart removal/destruction, disconnect, respawn, dimension changes, new ridden targets, and protection against unrelated nearby carts were also tested locally.
 
 ## Author
 
