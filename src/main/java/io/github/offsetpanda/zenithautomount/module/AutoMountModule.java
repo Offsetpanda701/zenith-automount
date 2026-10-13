@@ -21,6 +21,7 @@ import org.geysermc.mcprotocollib.protocol.data.game.entity.type.EntityType;
 import org.geysermc.mcprotocollib.protocol.packet.ingame.clientbound.ClientboundRespawnPacket;
 import org.geysermc.mcprotocollib.protocol.packet.ingame.clientbound.entity.ClientboundRemoveEntitiesPacket;
 import org.geysermc.mcprotocollib.protocol.packet.ingame.clientbound.entity.ClientboundSetPassengersPacket;
+import org.geysermc.mcprotocollib.protocol.packet.ingame.clientbound.entity.player.ClientboundPlayerPositionPacket;
 import org.geysermc.mcprotocollib.protocol.packet.ingame.serverbound.player.ServerboundInteractPacket;
 
 import java.util.List;
@@ -39,9 +40,10 @@ public final class AutoMountModule extends Module {
     private boolean recoveryEnabled;
     private Entity rememberedMinecart;
     private boolean recovering;
-    private boolean requirePassengerMount;
+    private boolean outOfRangeLastTick;
     private long stateGeneration;
     private boolean interactionPending;
+    private boolean pendingTickAttempt;
     private boolean attemptLogged;
     private boolean targetOccupied;
 
@@ -67,6 +69,7 @@ public final class AutoMountModule extends Module {
             .setPriority(-5)
             .state(ProtocolState.GAME, PacketHandlerStateCodec.clientBuilder()
                 .inbound(ClientboundSetPassengersPacket.class, new PassengerUpdateHandler())
+                .inbound(ClientboundPlayerPositionPacket.class, new PlayerPositionHandler())
                 .inbound(ClientboundRemoveEntitiesPacket.class, new EntityRemovalHandler())
                 .inbound(ClientboundRespawnPacket.class, new RespawnHandler())
                 .build())
@@ -79,7 +82,6 @@ public final class AutoMountModule extends Module {
         synchronized (targetStateLock) {
             clearTarget();
             recoveryEnabled = true;
-            requirePassengerMount = false;
             generation = stateGeneration;
             MODULE_LOG.info("[AutoMount] enabled");
         }
@@ -89,9 +91,14 @@ public final class AutoMountModule extends Module {
         client.executeInEventLoop(() -> {
             synchronized (targetStateLock) {
                 if (recoveryEnabled && generation == stateGeneration
-                    && Proxy.getInstance().getClient() == client
+                    && isCurrentSession(client)
                     && CACHE.getPlayerCache().isAlive()) {
-                    observeCurrentVehicle();
+                    final Entity player = CACHE.getPlayerCache().getThePlayer();
+                    final Entity vehicle = player.isInVehicle()
+                        ? CACHE.getEntityCache().get(player.getVehicleId()) : null;
+                    if (isValidMinecart(vehicle) && vehicle.getPassengerIds().contains(player.getEntityId())) {
+                        rememberRide(vehicle);
+                    }
                 }
             }
         });
@@ -128,17 +135,17 @@ public final class AutoMountModule extends Module {
                 clearTarget("player not alive");
                 return;
             }
-            if (observeCurrentVehicle()) return;
+            if (observeRememberedRide()) return;
             final Entity target = validRememberedMinecart();
             if (target == null) return;
             beginRecovery(target);
-            attemptRemount(target);
+            attemptRemount(target, true);
         }
     }
 
-    private void handlePassengerUpdate(final ClientboundSetPassengersPacket packet) {
+    private void handlePassengerUpdate(final ClientboundSetPassengersPacket packet, final ClientSession session) {
         synchronized (targetStateLock) {
-            if (!recoveryEnabled) return;
+            if (!recoveryEnabled || !isCurrentSession(session)) return;
             if (!CACHE.getPlayerCache().isAlive()) {
                 clearTarget("player not alive");
                 return;
@@ -149,42 +156,35 @@ public final class AutoMountModule extends Module {
             final Entity player = CACHE.getPlayerCache().getThePlayer();
             for (final int passengerId : packet.getPassengerIds()) {
                 if (passengerId == player.getEntityId()) {
-                    requirePassengerMount = false;
                     final Entity vehicle = CACHE.getEntityCache().get(packet.getEntityId());
                     if (isValidMinecart(vehicle)) rememberRide(vehicle);
                     else clearTarget("player already mounted");
                     return;
                 }
             }
-            if (observeCurrentVehicle()) return;
+            if (observeRememberedRide()) return;
             final Entity target = validRememberedMinecart();
             if (target != null && packet.getEntityId() == target.getEntityId()) {
                 beginRecovery(target);
-                attemptRemount(target);
+                if (!attemptLogged) attemptRemount(target, false);
             }
         }
     }
 
-    /** Uses server passenger membership even when Zenith's player vehicle fields disagree. */
-    private boolean observeCurrentVehicle() {
+    /** Passenger membership wins over unconfirmed cached vehicle flags. */
+    private boolean observeRememberedRide() {
         final Entity player = CACHE.getPlayerCache().getThePlayer();
-        // Same-dimension respawn can retain old passenger fields in Zenith's cache.
-        // A fresh server passenger update must establish the next ride after a reset.
-        if (requirePassengerMount) return player.isInVehicle();
-        final Entity vehicle = player.isInVehicle()
-            ? CACHE.getEntityCache().get(player.getVehicleId()) : null;
-        if (isValidMinecart(vehicle) && vehicle.getPassengerIds().contains(player.getEntityId())) {
-            rememberRide(vehicle);
-            return true;
-        }
         if (isValidMinecart(rememberedMinecart)
             && rememberedMinecart.getPassengerIds().contains(player.getEntityId())) {
             rememberRide(rememberedMinecart);
             return true;
         }
-        if (!player.isInVehicle()) return false;
-        clearTarget("player already mounted");
-        return true;
+        return false;
+    }
+
+    private boolean isCurrentSession(final ClientSession session) {
+        return Proxy.getInstance().getClient() == session && session.isConnected()
+            && !session.getClientEventLoop().isShuttingDown();
     }
 
     private void rememberRide(final Entity vehicle) {
@@ -233,12 +233,17 @@ public final class AutoMountModule extends Module {
     }
 
     /** One immediate attempt, then at most one per client tick; no cooldown or retry scheduler. */
-    private void attemptRemount(final Entity target) {
-        if (interactionPending) return;
+    private void attemptRemount(final Entity target, final boolean tickAttempt) {
+        if (interactionPending) {
+            // A tick can share the queued first attempt without adding another send.
+            pendingTickAttempt |= tickAttempt;
+            return;
+        }
         final ClientSession client = Proxy.getInstance().getClient();
-        if (client == null || !client.isConnected() || client.getChannel() == null) return;
+        if (client == null || !isCurrentSession(client) || client.getChannel() == null) return;
         final long generation = stateGeneration;
         interactionPending = true;
+        pendingTickAttempt = tickAttempt;
         try {
             // Finish already-queued passenger/teleport updates before evaluating
             // recovery. Dismount can arrive before the authoritative player position.
@@ -246,23 +251,31 @@ public final class AutoMountModule extends Module {
             client.getClientEventLoop().execute(() -> {
                 synchronized (targetStateLock) {
                     if (generation != stateGeneration) return;
+                    final boolean checkRangeLoss = pendingTickAttempt;
                     interactionPending = false;
+                    pendingTickAttempt = false;
                     if (!recoveryEnabled || !recovering || rememberedMinecart != target
-                        || Proxy.getInstance().getClient() != client || !client.isConnected()
+                        || !isCurrentSession(client)
                         || client.getPacketProtocol().getOutboundState() != ProtocolState.GAME) return;
                     if (!CACHE.getPlayerCache().isAlive()) {
                         clearTarget("player not alive");
                         return;
                     }
-                    if (observeCurrentVehicle()) return;
+                    if (observeRememberedRide()) return;
                     if (!isValidMinecart(target)) {
                         clearTarget("target removed/invalid");
                         return;
                     }
                     if (!isReachable(target)) {
-                        clearTarget("target out of range");
+                        // Confirm range loss on consecutive tick assessments, not
+                        // the first passenger/position notification's snapshot.
+                        if (checkRangeLoss) {
+                            if (outOfRangeLastTick) clearTarget("target out of range");
+                            else outOfRangeLastTick = true;
+                        }
                         return;
                     }
+                    outOfRangeLastTick = false;
                     if (!target.getPassengerIds().isEmpty()) {
                         if (!targetOccupied) MODULE_LOG.info("[AutoMount] target occupied id={}", target.getEntityId());
                         targetOccupied = true;
@@ -282,12 +295,12 @@ public final class AutoMountModule extends Module {
         }
     }
 
-    private void handleEntityRemoval(final ClientboundRemoveEntitiesPacket packet) {
+    private void handleEntityRemoval(final ClientboundRemoveEntitiesPacket packet, final ClientSession session) {
         synchronized (targetStateLock) {
-            if (rememberedMinecart == null) return;
+            if (!isCurrentSession(session) || rememberedMinecart == null) return;
             for (final int id : packet.getEntityIds()) {
                 if (id == rememberedMinecart.getEntityId()) {
-                    clearTarget("target removed");
+                    clearTarget("target removed/untracked");
                     return;
                 }
             }
@@ -296,7 +309,6 @@ public final class AutoMountModule extends Module {
 
     private void clearRecovery(final String reason) {
         synchronized (targetStateLock) {
-            requirePassengerMount = true;
             clearTarget(reason);
         }
     }
@@ -311,15 +323,30 @@ public final class AutoMountModule extends Module {
         rememberedMinecart = null;
         recovering = false;
         interactionPending = false;
+        pendingTickAttempt = false;
         attemptLogged = false;
         targetOccupied = false;
+        outOfRangeLastTick = false;
         stateGeneration++;
     }
 
     private final class PassengerUpdateHandler implements ClientEventLoopPacketHandler<ClientboundSetPassengersPacket, ClientSession> {
         @Override
         public boolean applyAsync(final ClientboundSetPassengersPacket packet, final ClientSession session) {
-            handlePassengerUpdate(packet);
+            handlePassengerUpdate(packet, session);
+            return true;
+        }
+    }
+
+    private final class PlayerPositionHandler implements ClientEventLoopPacketHandler<ClientboundPlayerPositionPacket, ClientSession> {
+        @Override
+        public boolean applyAsync(final ClientboundPlayerPositionPacket packet, final ClientSession session) {
+            synchronized (targetStateLock) {
+                if (recoveryEnabled && isCurrentSession(session) && recovering && !attemptLogged
+                    && rememberedMinecart != null) {
+                    attemptRemount(rememberedMinecart, false);
+                }
+            }
             return true;
         }
     }
@@ -327,7 +354,7 @@ public final class AutoMountModule extends Module {
     private final class EntityRemovalHandler implements ClientEventLoopPacketHandler<ClientboundRemoveEntitiesPacket, ClientSession> {
         @Override
         public boolean applyAsync(final ClientboundRemoveEntitiesPacket packet, final ClientSession session) {
-            handleEntityRemoval(packet);
+            handleEntityRemoval(packet, session);
             return true;
         }
     }
@@ -335,7 +362,9 @@ public final class AutoMountModule extends Module {
     private final class RespawnHandler implements ClientEventLoopPacketHandler<ClientboundRespawnPacket, ClientSession> {
         @Override
         public boolean applyAsync(final ClientboundRespawnPacket packet, final ClientSession session) {
-            clearRecovery("respawn/world transition");
+            synchronized (targetStateLock) {
+                if (isCurrentSession(session)) clearTarget("respawn/world transition");
+            }
             return true;
         }
     }
